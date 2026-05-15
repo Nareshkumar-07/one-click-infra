@@ -1,0 +1,52 @@
+# ============================================================
+# .gitignore — Terraform & Project Ignores
+# ============================================================
+
+# ── Terraform State ──────────────────────────────────────────
+# NEVER commit state files — they contain sensitive data
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Terraform lock file for providers (keep this — it pins versions)
+# .terraform.lock.hcl  ← intentionally NOT ignored
+
+# ── Terraform Working Directory ──────────────────────────────
+.terraform/
+.terraform.tfplan
+
+# ── Plan Files ───────────────────────────────────────────────
+*.tfplan
+tfplan
+plan_output.txt
+
+# ── Variable Files with Secrets ──────────────────────────────
+# Uncomment the line below if your tfvars contain real secrets
+# terraform.tfvars
+*.auto.tfvars
+
+# ── Crash Logs ───────────────────────────────────────────────
+crash.log
+crash.*.log
+
+# ── Override Files ───────────────────────────────────────────
+# These are local developer overrides — not for version control
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# ── OS & Editor Files ────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.iml
+
+# ── Environment Files ────────────────────────────────────────
+.env
+.env.*
+!.env.example
+terraform.exe 
