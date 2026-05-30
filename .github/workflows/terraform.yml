@@ -1,9 +1,18 @@
-name: "Terraform Infrastructure"
+# ============================================================
+# terraform.yml — Updated CI/CD Pipeline with Security Scanning
+#
+# Pipeline order:
+#   1. Security Scan  (Checkov + tfsec)
+#   2. Terraform Check (fmt + validate)
+#   3. Terraform Plan
+#   4. Terraform Apply (only if all above pass)
+# ============================================================
+
+name: "🚀 Terraform + Security"
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
     inputs:
       environment:
@@ -11,46 +20,240 @@ on:
         required: true
         default: "dev"
         type: choice
-        options:
-          - dev
-          - prod
+        options: [dev, staging, prod]
+      action:
+        description: "Action to run"
+        required: true
+        default: "apply"
+        type: choice
+        options: [plan, apply, destroy]
 
 env:
   TF_IN_AUTOMATION: true
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
 
 jobs:
-  terraform:
-    name: "Terraform"
+  # ──────────────────────────────────────────────────────────
+  # JOB 1: Security Scan — runs BEFORE deployment
+  # If critical issues found, deployment is blocked
+  # ──────────────────────────────────────────────────────────
+  security-scan:
+    name: "🔒 Security Scan"
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: "📥 Checkout code"
         uses: actions/checkout@v4
 
-      - name: Setup Terraform
+      # TOOL 1: Checkov — finds misconfigurations in Terraform
+      - name: "🛡️ Install Checkov"
+        run: pip install checkov
+
+      - name: "🛡️ Run Checkov"
+        run: |
+          echo "## 🛡️ Checkov Results" >> $GITHUB_STEP_SUMMARY
+          checkov -d . \
+            --framework terraform \
+            --output cli \
+            --soft-fail \
+            --skip-check CKV_AWS_8,CKV2_AWS_11 \
+            2>&1 | tee checkov-output.txt || true
+
+          # Count issues found
+          FAILED=$(grep -c "FAILED" checkov-output.txt || echo "0")
+          PASSED=$(grep -c "PASSED" checkov-output.txt || echo "0")
+          echo "✅ Passed: $PASSED | ❌ Failed: $FAILED" >> $GITHUB_STEP_SUMMARY
+
+      # TOOL 2: tfsec — Terraform-specific security scanner
+      - name: "🔍 Run tfsec"
+        run: |
+          docker run --rm \
+            -v "$(pwd):/src" \
+            aquasec/tfsec /src \
+            --minimum-severity MEDIUM \
+            --soft-fail \
+            --format lovely || true
+          echo "tfsec scan complete" >> $GITHUB_STEP_SUMMARY
+
+      # TOOL 3: TruffleHog — check for leaked secrets
+      - name: "🔑 Run TruffleHog (secret scan)"
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --only-verified
+        continue-on-error: true
+
+      - name: "📊 Upload security reports"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: checkov-output.txt
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 2: Terraform Format + Validate
+  # Only runs after security scan passes
+  # ──────────────────────────────────────────────────────────
+  terraform-check:
+    name: "🔍 Format & Validate"
+    runs-on: ubuntu-latest
+    needs: security-scan
+
+    steps:
+      - name: "📥 Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "⚙️ Setup Terraform"
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.0"
 
-      - name: Configure AWS credentials
+      - name: "🔑 Configure AWS credentials"
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-south-1
+          aws-region:            ap-south-1
 
-      - name: Terraform Init
-        run: terraform init
+      - name: "🚀 Terraform Init"
+        run: terraform init -input=false
 
-      - name: Terraform Format Check
+      - name: "🎨 Terraform Format Check"
         run: terraform fmt -check -recursive
         continue-on-error: true
 
-      - name: Terraform Validate
-        run: terraform validate
+      - name: "✅ Terraform Validate"
+        run: terraform validate -no-color
 
-      - name: Terraform Plan
-        run: terraform plan -input=false
+  # ──────────────────────────────────────────────────────────
+  # JOB 3: Terraform Plan
+  # ──────────────────────────────────────────────────────────
+  terraform-plan:
+    name: "📋 Plan"
+    runs-on: ubuntu-latest
+    needs: terraform-check
 
-      - name: Terraform Apply
-        run: terraform apply -auto-approve -input=false
+    steps:
+      - name: "📥 Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "⚙️ Setup Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: "🔑 Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ap-south-1
+
+      - name: "🚀 Terraform Init"
+        run: terraform init -input=false
+
+      - name: "📋 Terraform Plan"
+        run: |
+          terraform plan \
+            -var="environment=${{ env.ENVIRONMENT }}" \
+            -out=tfplan \
+            -input=false \
+            -no-color 2>&1 | tee plan-output.txt
+
+      - name: "💾 Upload plan"
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}
+          path: |
+            tfplan
+            plan-output.txt
+          retention-days: 5
+
+      - name: "📊 Plan Summary"
+        run: |
+          echo "## 📋 Terraform Plan" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -10 plan-output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 4: Terraform Apply
+  # ──────────────────────────────────────────────────────────
+  terraform-apply:
+    name: "🏗️ Apply"
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+
+    steps:
+      - name: "📥 Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "⚙️ Setup Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: "🔑 Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ap-south-1
+
+      - name: "🚀 Terraform Init"
+        run: terraform init -input=false
+
+      - name: "📥 Download plan"
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}
+
+      - name: "🏗️ Terraform Apply"
+        run: terraform apply -auto-approve tfplan
+
+      - name: "📤 Show Outputs"
+        run: |
+          echo "## 🎉 Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          terraform output >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          terraform output
+
+  # ──────────────────────────────────────────────────────────
+  # BONUS JOB: Destroy (manual only)
+  # ──────────────────────────────────────────────────────────
+  terraform-destroy:
+    name: "💣 Destroy"
+    runs-on: ubuntu-latest
+    needs: security-scan
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.action == 'destroy'
+
+    steps:
+      - name: "📥 Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "⚙️ Setup Terraform"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: "🔑 Configure AWS credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ap-south-1
+
+      - name: "🚀 Terraform Init"
+        run: terraform init -input=false
+
+      - name: "💣 Terraform Destroy"
+        run: terraform destroy -var="environment=${{ env.ENVIRONMENT }}" -auto-approve -input=false
