@@ -1,0 +1,152 @@
+# ============================================================
+# security-scan.yml — Security Scanning Pipeline
+#
+# Runs on every push to main and pull requests.
+# Tools used:
+#   1. Checkov     — scans Terraform code for misconfigurations
+#   2. tfsec       — Terraform security scanner
+#   3. trufflehog  — scans for leaked secrets in code
+# ============================================================
+
+name: "🔒 Security Scan"
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  # Run every day at midnight to catch new vulnerabilities
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # JOB 1: Checkov — Terraform Misconfiguration Scanner
+  # Checks your .tf files for security best practice violations
+  # ──────────────────────────────────────────────────────────
+  checkov-scan:
+    name: "🛡️ Checkov Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "📥 Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "🐍 Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: "📦 Install Checkov"
+        run: pip install checkov
+
+      - name: "🛡️ Run Checkov scan"
+        id: checkov
+        run: |
+          checkov -d . \
+            --framework terraform \
+            --output cli \
+            --output sarif \
+            --output-file-path console,checkov-results.sarif \
+            --soft-fail \
+            --skip-check CKV_AWS_8,CKV2_AWS_11
+          # --soft-fail means pipeline won't break on findings
+          # CKV_AWS_8  = EC2 detailed monitoring (skipped for free tier)
+          # CKV2_AWS_11 = VPC flow logs (skipped, no VPC in this project)
+        continue-on-error: true
+
+      - name: "📊 Upload Checkov results"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checkov-results
+          path: checkov-results.sarif
+          retention-days: 30
+
+      - name: "📋 Checkov Summary"
+        run: |
+          echo "## 🛡️ Checkov Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "Scan complete. Download the artifact for full SARIF report." >> $GITHUB_STEP_SUMMARY
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 2: tfsec — Terraform Security Scanner
+  # Specifically designed for Terraform — catches AWS-specific issues
+  # ──────────────────────────────────────────────────────────
+  tfsec-scan:
+    name: "🔍 tfsec Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "📥 Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "🔍 Run tfsec"
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          soft_fail: true        # Don't fail the pipeline, just report
+          format: lovely         # Human-readable output
+          additional_args: >
+            --exclude-path .terraform
+            --minimum-severity MEDIUM
+
+      - name: "🔍 Run tfsec with JSON output"
+        run: |
+          docker run --rm \
+            -v "$(pwd):/src" \
+            aquasec/tfsec /src \
+            --format json \
+            --out /src/tfsec-results.json \
+            --soft-fail || true
+
+      - name: "📊 Upload tfsec results"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tfsec-results
+          path: tfsec-results.json
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 3: TruffleHog — Secret/Credential Leak Scanner
+  # Scans git history for accidentally committed secrets
+  # ──────────────────────────────────────────────────────────
+  secret-scan:
+    name: "🔑 Secret Scan (TruffleHog)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "📥 Checkout code (full history)"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       # Full git history needed for secret scanning
+
+      - name: "🔑 Run TruffleHog"
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --debug --only-verified
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 4: Security Summary Report
+  # Combines all results into one report
+  # ──────────────────────────────────────────────────────────
+  security-summary:
+    name: "📋 Security Summary"
+    runs-on: ubuntu-latest
+    needs: [checkov-scan, tfsec-scan, secret-scan]
+    if: always()   # Run even if previous jobs failed
+
+    steps:
+      - name: "📋 Generate Summary"
+        run: |
+          echo "## 🔒 Security Scan Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🛡️ Checkov (IaC misconfigurations) | ${{ needs.checkov-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔍 tfsec (Terraform security) | ${{ needs.tfsec-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔑 TruffleHog (Secret leaks) | ${{ needs.secret-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download artifacts above for detailed reports." >> $GITHUB_STEP_SUMMARY
